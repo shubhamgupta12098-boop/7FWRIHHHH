@@ -1,8 +1,8 @@
 {
   "name": "foodwise-pro-local-first",
-  "version": "32.0.0",
+  "version": "40.0.0",
   "private": true,
-  "description": "FoodWise Pro v32: security-hardened sessions, API protection, rate limiting, secure headers, mobile compatibility, and voice assistant.",
+  "description": "FoodWise Pro v40: v39 features with safe Render deployment verification endpoint and cache refresh.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

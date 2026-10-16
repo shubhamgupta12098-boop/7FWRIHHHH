@@ -7,6 +7,8 @@ let MongoClient=null, GridFSBucket=null, ObjectId=null, webPush=null;
 try { ({ MongoClient, GridFSBucket, ObjectId } = require('mongodb')); } catch { /* Local Mode runs with Node.js built-ins only. */ }
 try { webPush = require('web-push'); } catch { /* Push stays optional until npm install installs web-push. */ }
 
+const APP_VERSION = '40.0.0';
+const FRONTEND_VERSION = '40';
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 
@@ -110,6 +112,8 @@ function day(offset = 0) {
   return d.toISOString().slice(0, 10);
 }
 
+const CHAT_REPLY_LIMIT = 30; // Count completed assistant responses, not individual chat bubbles.
+const chatWriteLocks = new Map();
 const CONSUMED_RETENTION_DAYS = 7;
 const CONSUMED_RETENTION_MS = CONSUMED_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 function consumedTimestamp(x = {}) {
@@ -302,7 +306,9 @@ function migrateState(input, user = {}) {
   if (!db.mealIngredients || typeof db.mealIngredients !== 'object' || Array.isArray(db.mealIngredients)) db.mealIngredients = {};
   if (!db.mealImages || typeof db.mealImages !== 'object' || Array.isArray(db.mealImages)) db.mealImages = {};
   for (const k of ['inventory','consumed','leftovers','shopping','waste','recipes','challenges','cart','orders','savedRecipes','dailyEssentials','chatHistory']) if (!Array.isArray(db[k])) db[k] = [];
-  db.chatHistory = db.chatHistory.filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.text === 'string').slice(-100).map(m => ({ id: safeText(m.id || '', 80), role: m.role, text: safeText(m.text, 12000), youtubeSearchUrl: safeText(m.youtubeSearchUrl || '', 2000), youtubeQuery: safeText(m.youtubeQuery || '', 300), warning: safeText(m.warning || '', 1000), createdAt: safeText(m.createdAt || '', 80) }));
+  db.chatHistory = db.chatHistory.filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.text === 'string').slice(-(CHAT_REPLY_LIMIT * 2)).map(m => ({ id: safeText(m.id || '', 80), role: m.role, text: safeText(m.text, 12000), youtubeSearchUrl: safeText(m.youtubeSearchUrl || '', 2000), youtubeQuery: safeText(m.youtubeQuery || '', 300), warning: safeText(m.warning || '', 1000), createdAt: safeText(m.createdAt || '', 80) }));
+  // Existing v25-v33 chats may already have 30+ replies: purge them on first load.
+  if (db.chatHistory.filter(m => m.role === 'assistant').length >= CHAT_REPLY_LIMIT) db.chatHistory = [];
   enforceConsumedRetention(db);
   // v15 planner is inventory-locked: discard legacy/free-text meal slots that do not reference live inventory IDs.
   const liveIds = new Set(db.inventory.filter(x => !x?.expiry || String(x.expiry) >= day(0)).map(x => String(x.id)));
@@ -491,7 +497,12 @@ async function getUserState(user) {
   if (doc?.data) {
     const data = migrateState(doc.data, user);
     if (JSON.stringify(doc.data) !== JSON.stringify(data)) {
-      await statesCol.updateOne({ _id: key }, { $set: { data, updatedAt: new Date() } });
+      // Update individual fields; never replace the whole document and overwrite a chat response.
+      const changes = {};
+      for (const [field, value] of Object.entries(data)) {
+        if (/^[a-zA-Z][a-zA-Z0-9_]*$/.test(field) && JSON.stringify(doc.data[field]) !== JSON.stringify(value)) changes[`data.${field}`] = value;
+      }
+      if (Object.keys(changes).length) await statesCol.updateOne({ _id: key }, { $set: { ...changes, updatedAt: new Date() } });
     }
     return data;
   }
@@ -499,11 +510,56 @@ async function getUserState(user) {
   await statesCol.updateOne({ _id: key }, { $set: { data, createdAt: new Date(), updatedAt: new Date() } }, { upsert: true });
   return data;
 }
-async function saveUserState(user, state) {
+async function saveUserState(user, state, { resetChat = false } = {}) {
   const data = migrateState(state, user || (LOCAL_MODE ? localUser() : {}));
-  if (LOCAL_MODE) { fs.mkdirSync(path.dirname(LOCAL_STATE_FILE), { recursive: true }); fs.writeFileSync(LOCAL_STATE_FILE, JSON.stringify(data, null, 2)); return data; }
-  await statesCol.updateOne({ _id: String(user._id || user.id) }, { $set: { data, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+  if (LOCAL_MODE) {
+    // Chat is server-owned. A delayed /api/state request must not reintroduce erased messages.
+    if (!resetChat) data.chatHistory = readLocalState().chatHistory;
+    fs.mkdirSync(path.dirname(LOCAL_STATE_FILE), { recursive: true });
+    fs.writeFileSync(LOCAL_STATE_FILE, JSON.stringify(data, null, 2));
+    return data;
+  }
+  // Update all non-chat fields without replacing data.chatHistory in MongoDB.
+  const changes = { updatedAt: new Date() };
+  for (const [field, value] of Object.entries(data)) {
+    if (field !== 'chatHistory' && /^[a-zA-Z][a-zA-Z0-9_]*$/.test(field)) changes[`data.${field}`] = value;
+  }
+  if (resetChat) changes['data.chatHistory'] = [];
+  await statesCol.updateOne({ _id: String(user._id || user.id) }, { $set: changes, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
   return data;
+}
+
+async function serializeUserChat(userId, task) {
+  const previous = chatWriteLocks.get(userId) || Promise.resolve();
+  const current = previous.catch(() => {}).then(task);
+  chatWriteLocks.set(userId, current);
+  try { return await current; }
+  finally { if (chatWriteLocks.get(userId) === current) chatWriteLocks.delete(userId); }
+}
+
+async function saveAssistantTurn(user, question, reply) {
+  const userId = String(user._id || user.id);
+  return serializeUserChat(userId, async () => {
+    const st = await getUserState(user);
+    const now = new Date().toISOString();
+    const entryId = crypto.randomUUID();
+    const history = [...(st.chatHistory || []),
+      { id: `u-${entryId}`, role: 'user', text: safeText(question, 12000), createdAt: now },
+      { id: `a-${entryId}`, role: 'assistant', text: safeText(reply.answer || '', 12000), youtubeSearchUrl: safeText(reply.youtubeSearchUrl || '', 2000), youtubeQuery: safeText(reply.youtubeQuery || '', 300), warning: safeText(reply.warning || '', 1000), createdAt: new Date().toISOString() }
+    ];
+    const replies = history.filter(m => m.role === 'assistant').length;
+    const chatReset = replies >= CHAT_REPLY_LIMIT;
+    // On the 30th answer, MongoDB is updated to an empty history immediately.
+    // No separate collection stores these messages.
+    const nextHistory = chatReset ? [] : history;
+    if (LOCAL_MODE) {
+      st.chatHistory = nextHistory;
+      fs.writeFileSync(LOCAL_STATE_FILE, JSON.stringify(st, null, 2));
+    } else {
+      await statesCol.updateOne({ _id: userId }, { $set: { 'data.chatHistory': nextHistory, updatedAt: new Date() } });
+    }
+    return { chatHistory: nextHistory, chatReset, chatReplyLimit: CHAT_REPLY_LIMIT, repliesUsed: chatReset ? 0 : replies };
+  });
 }
 async function sessionUser(req) {
   if (LOCAL_MODE) {
@@ -547,7 +603,7 @@ function firebaseFriendlyError(code = '') {
     INVALID_LOGIN_CREDENTIALS: 'Invalid email or password.',
     USER_DISABLED: 'This account has been disabled.',
     INVALID_EMAIL: 'Please enter a valid email address.',
-    WEAK_PASSWORD: 'Use at least 10 characters with letters and numbers.',
+    WEAK_PASSWORD: 'Use a password with at least 6 characters. Letters, numbers, or symbols are all allowed.',
     API_KEY_INVALID: 'Firebase API key is invalid or restricted for this request.'
   };
   return map[c] || code || 'Firebase Authentication request failed';
@@ -649,7 +705,8 @@ function parseBody(req, limit = MAX_JSON_BODY) {
   });
 }
 function safeText(value, max = 120) { return String(value || '').trim().slice(0, max); }
-function strongPassword(password='') { const p=String(password); return p.length >= 10 && /[A-Za-z]/.test(p) && /\d/.test(p); }
+// Firebase Email/Password requires 6+ characters. Let users choose their own mix of characters.
+function acceptablePassword(password='') { const p=String(password); return p.length >= 6; }
 function slug(value) { return safeText(value, 80).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 45) || 'food'; }
 function hash(value) { return crypto.createHash('sha1').update(value).digest('hex').slice(0, 10); }
 
@@ -1072,6 +1129,133 @@ function requestedLanguage(language, state) {
 }
 function localLangText(lang, en, hinglish, hi) { return lang === 'hi' ? hi : lang === 'hinglish' ? hinglish : en; }
 
+// v38: conversational EQ shared by local/offline and Gemini chat. Detect the language
+// of the message rather than forcing a Hinglish question into English app settings.
+function friendlyResponseLanguage(question, language, state) {
+  const q = String(question || '');
+  if (/[\u0900-\u097f]/.test(q)) return 'hi';
+  if (/\b(mera|meri|mere|mujhe|hamare|humare|tum|tumhe|aap|apna|kaise|kese|kyun|kya|kitna|kitni|batao|btao|karu|karo|chahiye|ho\s*gaya|gya|gayi|bacha|kharab|khana|doodh|tamatar|paisa|paise|sakta|sakti|sakte|kar|kr|ko|hu|hun|hai|hain|bahut|bohot|achha|accha|shukriya|dhanyavaad|udaas|pareshan|tension|afsos)\b/i.test(q)) return 'hinglish';
+  return requestedLanguage(language, state);
+}
+function friendlyConversationReply(question, state, language='') {
+  const q = String(question || '').trim().toLowerCase().replace(/[!?.।]+$/g, '').trim();
+  const lang = friendlyResponseLanguage(question, language, state);
+  const L = (en,hinglish,hi) => localLangText(lang,en,hinglish,hi);
+  let answer='';
+  // Small talk is deliberately narrow so a greeting plus a real question still
+  // reaches inventory, recycling or Gemini instead of being swallowed.
+  if (/^(hi|hii+|hey|hello|namaste|namaskar|नमस्ते|नमस्कार|हेलो|हाय|good (morning|evening|afternoon))$/.test(q)) {
+    answer=L('Hey! Good to see you. Tell me what is happening in your kitchen, or ask me about meals, expiry dates or food waste.',
+      'Hey! Kaise ho? Aaj kitchen mein kya chal raha hai? Meal plan, expiry ya food waste — jo poochna ho, batao.',
+      'नमस्ते! कैसे हैं? आज किचन में क्या चल रहा है? मील प्लान, एक्सपायरी या खाने की बर्बादी पर जो पूछना हो, बताइए।');
+  } else if (/^(thanks|thank you|thankyou|thx|shukriya|dhanyavaad|बहुत शुक्रिया|शुक्रिया|धन्यवाद|thank you so much)$/.test(q)) {
+    answer=L('You are welcome! Happy to help. Come back anytime you need a food-saving idea.',
+      'Arey, welcome! Kabhi bhi food bachane ya meal plan karne mein help chahiye to pooch lena.',
+      'आपका स्वागत है! खाना बचाने या मील प्लान करने में कभी भी मदद चाहिए तो पूछिए।');
+  } else if (/^(how are you|how r u|kaise ho|kaisi ho|kaise hain|kaise hai|tum kaise ho|aap kaise ho|कैसे हो|कैसे हैं)$/.test(q)) {
+    answer=L('I am here and ready to help! How is your day going? Want to plan a meal or check your food?',
+      'Main yahin hoon, help ke liye ready! Aapka din kaisa ja raha hai? Koi food ya meal-plan wala kaam hai?',
+      'मैं यहीं हूँ, मदद के लिए तैयार! आपका दिन कैसा जा रहा है? कोई खाने या मील प्लान से जुड़ा सवाल है?');
+  } else if (/^(you are (great|helpful|nice)|nice job|good job|bahut (achhe|acche|badhiya)|mast ho|तुम बहुत अच्छे हो)$/.test(q)) {
+    answer=L('That is kind of you to say! What should we tackle next?',
+      'Shukriya! Chalo, ab next kis cheez mein help karun?',
+      'शुक्रिया! अब अगला कौन-सा काम करें?');
+  } else if (/(food|khana|khaana|sabzi|sabji|doodh|roti|chawal|meal|waste|खाना|भोजन|सब्ज|बर्बाद)/.test(q) &&
+             /(bura lag|afsos|guilt|guilty|sad|upset|pareshan|frustrat|tension|dukhi|udaas|regret|अफसोस|बुरा लग|दुख|परेशान|उदास|चिंता)/.test(q) &&
+             !/(kaise|kese|kya kar|kya kru|kaise kar|how|what should|recycl|compost|dispose|खाद|कैसे|क्या कर)/.test(q)) {
+    answer=L('It can feel disappointing when food gets wasted. You do not need to fix everything today. We can start small: log the wasted item, then plan smaller portions next time. Tell me which food was wasted and I will suggest a practical next step.',
+      'Khana waste ho jaaye to bura lag sakta hai. Chalo, ek chhote step se shuru karte hain: waste log karo, phir next time portion thoda adjust karenge. Kaunsa food waste hua? Main practical idea bataunga.',
+      'खाना बर्बाद हो जाए तो बुरा लग सकता है। छोटे कदम से शुरू करते हैं: वेस्ट लॉग करें और अगली बार मात्रा थोड़ी कम रखें। कौन-सा खाना खराब हुआ? मैं उपयोगी अगला कदम बताऊँगा।');
+  }
+  return answer ? { answer, youtubeQuery:'' } : null;
+}
+function friendlierLocalReply(question, reply, state, language='') {
+  if (!reply?.answer) return reply;
+  const q=String(question||'').toLowerCase(), lang=friendlyResponseLanguage(question,language,state);
+  const L=(en,hinglish,hi)=>localLangText(lang,en,hinglish,hi);
+  const worried=/(pareshan|tension|bura lag|afsos|guilty|frustrat|worr|stress|चिंता|परेशान|अफसोस|बुरा लग)/i.test(q);
+  // Acknowledge real worry briefly; do not add repeated praise or empathy to
+  // routine factual lookups, and never alter the data or Youtube search marker.
+  if (worried && !/(^it can feel|^khana waste|^खाना बर्बाद)/i.test(reply.answer)) {
+    return { ...reply, answer: L('I can see why that is frustrating. Let us focus on one useful next step. ',
+      'Samajh raha hoon, ye frustrating lag sakta hai. Chalo ek practical step dekhte hain. ',
+      'समझ सकता हूँ, यह परेशान करने वाली बात है। चलिए एक उपयोगी कदम देखते हैं। ') + reply.answer };
+  }
+  if (/\b(budget|paise|paisa|kharch|spent|money)\b|बजट|खर्च/i.test(q)) {
+    return { ...reply, answer: L('Here is your budget update:\n', 'Haan, budget ka update dekhte hain:\n', 'जी, बजट का अपडेट यह रहा:\n') + reply.answer };
+  }
+  if (/\b(expir|expiry|expire|jaldi kharab)\b|एक्सपायर|एक्सपायरी/i.test(q)) {
+    return { ...reply, answer: L('Let us check what needs attention first:\n', 'Chalo, pehle dekhte hain kya use karna zaroori hai:\n', 'देखते हैं पहले किस चीज़ पर ध्यान देना है:\n') + reply.answer };
+  }
+  return reply;
+}
+
+
+// Food-disposal requests must be answered BEFORE inventory, waste-log and recipe lookups.
+// Works without a Gemini key and avoids suggesting that spoiled ingredients can be eaten.
+function spoiledFoodRecyclingReply(question, state, language='') {
+  const rawQ=String(question||'').toLowerCase();
+  // Resolve "isko compost kaise karu?" when the immediately preceding user turn
+  // identified the spoiled item; do not use unrelated inventory as an assumption.
+  const previousUser=(state?.chatHistory||[]).slice().reverse().find(m=>m.role==='user')?.text || '';
+  const contextFollowUp=/(recycl|compost|khaad|khad|खाद|कम्पोस्ट|कंपोस्ट|रीसाइकल)/i.test(rawQ)
+    && !/(food|khana|khaana|milk|paneer|cheese|doodh|tomato|tamatar|sabzi|vegetable|fruit|banana|chicken|fish|meat|egg|bread|rice|chawal|oil|tel|दूध|टमाटर|पनीर|सब्ज|फल|मांस|रोटी|चावल|तेल)/i.test(rawQ)
+    && /(kharab|kharaab|spoiled|rotten|expired|moldy|mouldy|खराब|सड़|फफूंद|एक्सपायर)/i.test(previousUser);
+  const q=contextFollowUp ? `${String(previousUser).toLowerCase()} ${rawQ}` : rawQ;
+  const bad=/(spoiled|spoilt|rotten|moldy|mouldy|gone bad|gone off|stale|sour|expired|past expi|food waste|kharab|kharaab|khrab|basi|baasi|sad[ae]? hua|sad gaya|sada hua|gal gaya|gali hui|fungus|खराब|सड़|सड़|बासी|फफूंद|फफूँद|एक्सपायर|सड़ा|सड़ी|सड़ी|गल गया)/i;
+  const disposal=/(recycl|re.?use|compost|manure|fertili[sz]|biogas|dispose|disposal|discard|throw|bin\b|garbage|wet waste|waste management|kya kar|kya kru|kya karu|kya karoon|kaise|kaisa|kese|kaha fek|kahan fek|fek(u|na)|phenk|phe?k|khad|khaad|kya bana|kar sak|बनाऊ|क्या कर|कैसे|खाद|कम्पोस्ट|कंपोस्ट|रीसाइकल|रिसाइकल|निपटान|फेंक|नष्ट)/i;
+  const certainBad=/(kharab\s+ho\s+(gaya|gayi|gaye|gya|gyi|gye)|kharaab\s+ho\s+(gaya|gayi|gaye|gya|gyi|gye)|sad\s+gaya|gal\s+gaya|gone\s+bad|is\s+(spoiled|rotten|moldy)|has\s+(spoiled|rotted)|खराब\s+हो\s+ग|सड़\s+ग)/i;
+  // Also answer direct composting requests even when the user does not say "spoiled".
+  const compostRequest=/(compost|recycl|खाद|कम्पोस्ट|कंपोस्ट|रीसाइकल|रिसाइकल|biogas)/i.test(q) && /(food|khana|khaana|kitchen|leftover|sabzi|sabji|vegetable|fruit|tamatar|tomato|milk|doodh|bread|roti|cooking oil|used oil|frying oil|तेल|चावल|खाना|भोजन|सब्जी|फल|दूध|रोटी)/i.test(q);
+  if (!(bad.test(q) && (disposal.test(q) || certainBad.test(q))) && !compostRequest) return null;
+
+  const lang=friendlyResponseLanguage(q,language,state);
+  const L=(en,hinglish,hi)=>localLangText(lang,en,hinglish,hi);
+  const types=[
+    {kind:'oil',re:/(cooking oil|used oil|frying oil|tel\b|tail\b|तेल)/i},
+    {kind:'animal',re:/(chicken|meat|mutton|beef|fish|machli|machhli|anda|egg\b|eggs\b|prawn|मांस|मछली|चिकन|अंडा)/i},
+    {kind:'dairy',re:/(milk|doodh|dudh|paneer|cheese|curd|yogurt|yoghurt|dahi|butter|cream|दूध|पनीर|दही|मक्खन)/i},
+    {kind:'cooked',re:/(cooked|meal|leftover|dal\b|daal\b|rice|chawal|biryani|curry|fried|sabzi bani|paka hua|pakaaya|pakaya|paka hua khana|roti|chapati|bread|cake|biscuit|रोटी|चावल|पका|बचा हुआ|ब्रेड)/i},
+    {kind:'plant',re:/(tamatar|tomato|aloo|potato|onion|pyaz|carrot|gajar|banana|kela|apple|seb|mango|aam|orange|fruit|vegetable|vegetables|sabzi|sabji|salad|leaf|peel|chilke|spinach|palak|cucumber|grapes|टमाटर|आलू|प्याज|केला|सेब|फल|सब्ज|छिलक|पालक|गाजर)/i}
+  ];
+  const found=types.filter(t=>t.re.test(q)).map(t=>t.kind);
+  // Use the first named food category; the user can ask about additional foods separately.
+  const kind=found[0]||'unknown';
+  const sharedStart=kind==='oil'
+    ? L('Do not pour used cooking oil into a sink, drain or compost bin.',
+      'Used cooking oil ko sink, drain ya compost bin mein mat daalo.',
+      'इस्तेमाल किया तेल नाली, सिंक या कम्पोस्ट बिन में न डालें।')
+    : L('If food is truly rotten, moldy or smells spoiled, do not eat it, taste it, or feed it to animals.',
+      'Agar food sach mein sad gaya hai, fungus hai ya smell kharab hai, to ise na khao, na taste karo aur na hi animals ko khilao.',
+      'अगर खाना सच में सड़ गया है, फफूंद है या खराब गंध है, तो इसे न खाएँ, न चखें और न ही जानवरों को खिलाएँ।');
+  const intro=L('Sorry the food went bad. Let us find a safe, practical way to handle it.', 'Oh, khana kharab ho gaya? Chalo, ise safely handle karne ka practical tareeka dekhte hain.', 'ओह, खाना खराब हो गया? चलिए, इसे सुरक्षित तरीके से संभालने का आसान उपाय देखते हैं।');
+  const clean=L('Keep plastic wrappers, stickers and other packaging separate. Wash your hands and clean the container afterward.',
+    'Plastic packets, stickers aur packaging alag karo. Baad mein haath aur container saaf karo.',
+    'प्लास्टिक पैकेट, स्टिकर और पैकेजिंग अलग करें। बाद में हाथ और डिब्बा साफ करें।');
+  const itemAdvice={
+    plant: L('1. Remove plastic or stickers from the rotten fruits/vegetables.\n2. Cut into small pieces without handling mold closely; add to a covered home compost bin with dry leaves, shredded paper or cardboard.\n3. Mix/turn occasionally and keep it damp, not waterlogged; keep pests out.\n4. If heavily diseased or if you have no safe compost bin, use a municipal organic/wet-waste collection that accepts food scraps; otherwise dispose as local rules require.',
+      '1. Kharab fruits/sabzi se plastic aur stickers hatao.\n2. Chhote pieces karke covered compost bin mein sukhe patte, plain cardboard ya paper ke saath daalo; mold ko paas se smell mat karo.\n3. Kabhi-kabhi mix karo, halka moist rakho aur insects/animals se bachao.\n4. Bahut zyada fungal/diseased food ya compost bin na ho to local wet-waste collection mein do (agar allowed ho), warna local disposal rules follow karo.',
+      '1. सड़े फल/सब्ज़ियों से प्लास्टिक और स्टिकर हटाएँ।\n2. छोटे टुकड़े करके ढके हुए कम्पोस्ट बिन में सूखे पत्तों और बिना कोटिंग वाले कागज/गत्ते के साथ डालें; फफूंद को पास से न सूँघें।\n3. कभी-कभी मिलाएँ, हल्की नमी रखें और कीड़ों/जानवरों से बचाएँ।\n4. बहुत रोगग्रस्त पदार्थ या कम्पोस्ट बिन न हो, तो नगर निगम का स्वीकार्य गीला-कचरा संग्रह चुनें; नहीं तो स्थानीय नियमों से निपटाएँ।'),
+    animal: L('1. Do not add spoiled meat, fish or eggs to a typical open backyard compost pile: pathogens, odor and pests are concerns.\n2. Check whether your municipal organics/biogas collection specifically accepts these scraps.\n3. If not accepted, wrap or seal them in a leakproof bag/container and place in the designated waste bin; keep away from pets.\n4. Wash hands, surfaces and containers thoroughly.',
+      '1. Kharab meat, fish ya egg ko normal khule home compost mein mat daalo; germs, smell aur pests ka risk hota hai.\n2. Check karo municipal wet-waste/biogas service inko accept karti hai ya nahi.\n3. Accept nahi karti to leakproof bag mein seal karke designated dustbin mein daalo; pets se door rakho.\n4. Haath, surface aur dabbe achchhe se saaf karo.',
+      '1. खराब मांस, मछली या अंडे सामान्य खुले घरेलू कम्पोस्ट में न डालें; कीटाणु, गंध और कीड़ों का जोखिम है।\n2. पता करें कि नगरपालिका का जैविक-कचरा/बायोगैस संग्रह इन्हें स्वीकार करता है या नहीं।\n3. स्वीकार न हो तो रिसाव-रोधी बैग में बंद करके निर्धारित कूड़ेदान में डालें और पालतू जानवरों से दूर रखें।\n4. हाथ, सतह और डिब्बे अच्छी तरह साफ करें।'),
+    dairy: L('1. Do not eat or cook with spoiled milk, curd, paneer or cheese.\n2. Avoid putting dairy in a normal open home compost bin (odor and pests).\n3. Use a municipal organic-waste/biogas collection only if dairy is accepted; otherwise seal it securely and dispose in the designated bin. Avoid pouring large amounts into drains.\n4. Wash the container and your hands.',
+      '1. Kharab doodh, dahi, paneer ya cheese ko khane ya cooking mein use mat karo.\n2. Dairy ko normal open compost bin mein mat daalo; smell/pests ho sakte hain.\n3. Local wet-waste/biogas service dairy leti ho to wahan do; warna leakproof closed container/bag mein designated bin mein daalo. Zyada doodh drain mein mat bahaao.\n4. Container aur haath saaf karo.',
+      '1. खराब दूध, दही, पनीर या चीज़ को खाने या पकाने में उपयोग न करें।\n2. डेयरी को सामान्य खुले कम्पोस्ट में न डालें; गंध व कीड़ों की समस्या हो सकती है।\n3. नगरपालिका जैविक-कचरा/बायोगैस में डेयरी स्वीकार हो तो वहाँ दें; नहीं तो रिसाव-रोधी बंद बैग/डिब्बे में निर्धारित कूड़ेदान में डालें। अधिक मात्रा नाली में न बहाएँ।\n4. डिब्बा और हाथ साफ करें।'),
+    oil: L('1. Let used cooking oil cool completely.\n2. Pour into a clean, sealable container.\n3. Give it to a local used-cooking-oil collection/recycler where available; otherwise follow local household-waste rules.\n4. Never pour oil down the sink or mix it into a home compost bin.',
+      '1. Used cooking oil ko poori tarah thanda karo.\n2. Band hone wali bottle/dabbe mein bharo.\n3. Local used-oil recycling collection ho to wahan do; warna local disposal rules follow karo.\n4. Tel sink/drain mein ya compost bin mein mat daalo.',
+      '1. इस्तेमाल किए तेल को पूरी तरह ठंडा करें।\n2. बंद होने वाली बोतल/डिब्बे में भरें।\n3. स्थानीय प्रयुक्त-तेल रीसाइक्लिंग संग्रह हो तो वहाँ दें; नहीं तो स्थानीय निपटान नियम मानें।\n4. तेल नाली में या कम्पोस्ट बिन में न डालें।'),
+    cooked: L('1. Do not make a new recipe from moldy or spoiled cooked food, rice, roti or bread.\n2. For cooked, oily or mixed food, check if the municipal wet-waste/organics service accepts it.\n3. Avoid putting oily or animal-containing leftovers in a normal open home compost pile; they attract pests. Plain plant-based scraps may be composted in a secure bin if managed properly.\n4. Otherwise seal the waste, put it in the locally designated bin and wash the containers.',
+      '1. Kharab cooked food, chawal, roti ya bread se nayi recipe mat banao.\n2. Cooked/oily/mixed food ko local wet-waste collection accept karti hai to wahi do.\n3. Oily ya non-veg leftovers ko khule home compost mein mat daalo; pests aa sakte hain. Plain plant scraps secure bin mein compost ho sakte hain.\n4. Varna seal karke designated dustbin mein daalo aur container saaf karo.',
+      '1. खराब पके भोजन, चावल, रोटी या ब्रेड से नई रेसिपी न बनाएँ।\n2. नगर निगम का गीला-कचरा संग्रह पका/तैलीय भोजन स्वीकार करता हो तो वहाँ दें।\n3. तैलीय या मांस वाले बचे भोजन को खुले घरेलू कम्पोस्ट में न डालें; कीड़े आ सकते हैं। केवल सादा वनस्पति कचरा सुरक्षित बिन में कम्पोस्ट हो सकता है।\n4. अन्यथा बंद करके निर्धारित कूड़ेदान में डालें और डिब्बा साफ करें।'),
+    unknown: L('1. First identify the food type: fruit/vegetable, dairy, meat/fish/egg, cooked food or oil.\n2. Fruit/vegetable scraps can usually go into a covered home compost bin with dry leaves and paper.\n3. Meat, dairy and oily cooked foods generally should not go into an ordinary open home compost pile; use a collection service that accepts them, or the designated waste bin.\n4. Separate any packaging. Tell me which food spoiled and I will give the exact steps.',
+      '1. Pehle food ka type dekho: fruit/sabzi, dairy, meat/egg/fish, cooked food ya oil.\n2. Fruit/sabzi ko covered home compost bin mein sukhe patton ke saath daal sakte ho.\n3. Meat, dairy aur oily food ko open home compost mein mat daalo; accepting wet-waste service ya designated dustbin use karo.\n4. Packaging alag karo. Batao kaunsa food kharab hua hai, main uske exact steps bataunga.',
+      '1. पहले भोजन का प्रकार पहचानें: फल/सब्ज़ी, डेयरी, मांस/अंडा/मछली, पका भोजन या तेल।\n2. फल/सब्ज़ियों को ढके कम्पोस्ट बिन में सूखे पत्तों के साथ डाल सकते हैं।\n3. मांस, डेयरी व तैलीय भोजन खुले घरेलू कम्पोस्ट में न डालें; स्वीकृत गीला-कचरा सेवा या निर्धारित कूड़ेदान का उपयोग करें।\n4. पैकेजिंग अलग करें। बताएँ कौन-सा भोजन खराब हुआ है, मैं सही तरीके के चरण बताऊँगा।')
+  };
+  return {answer:`${intro}\n\n${sharedStart}\n\n${itemAdvice[kind]}\n\n${clean}`,youtubeQuery:''};
+}
+
+
 function liveInventoryItems(state) {
   const now = new Date(); now.setHours(0,0,0,0);
   return (state.inventory || []).filter(x => {
@@ -1155,7 +1339,7 @@ function appItemsSpeech(rows=[], lang='en', max=8, formatter=null) {
   return txt+extra;
 }
 function wholeAppAssistantReply(question, state, language='') {
-  const lang=requestedLanguage(language,state), q=String(question||'').toLowerCase();
+  const lang=friendlyResponseLanguage(question,language,state), q=String(question||'').toLowerCase();
   const inv=inventoryAssistantReply(question,state,lang); if(inv) return inv;
   if(!appQuestionIntent(q)) return null;
   const L=(en,hinglish,hi)=>localLangText(lang,en,hinglish,hi);
@@ -1251,8 +1435,10 @@ function wholeAppAssistantReply(question, state, language='') {
 }
 
 function aiReply(question, state, language = '') {
+  const recycling = spoiledFoodRecyclingReply(question, state, language);
+  if (recycling) return recycling;
   const q = (question || '').toLowerCase();
-  const lang = requestedLanguage(language, state);
+  const lang = friendlyResponseLanguage(question, language, state);
   if (/(shopping|shopping list|shop|grocery|cart|order|checkout|kharidari|kharidna|खरीदारी|कार्ट|ऑर्डर)/i.test(q)) return { answer: localLangText(lang, 'Shopping Q&A is disabled. Open the Shopping screen to view or manage shopping data.', 'Shopping Q&A hata diya hai. Shopping screen kholkar list ya cart manage karo.', 'Shopping Q&A बंद है। Shopping screen खोलकर list या cart manage करें।'), youtubeQuery: '' };
   const appAnswer = wholeAppAssistantReply(question, state, lang);
   if (appAnswer) return appAnswer;
@@ -1283,7 +1469,9 @@ function extractYoutubeMarker(text, fallback = '') {
 }
 
 async function aiReplyGemini(question, state, language = '') {
-  const lang = requestedLanguage(language, state);
+  const recycling = spoiledFoodRecyclingReply(question, state, language);
+  if (recycling) return recycling;
+  const lang = friendlyResponseLanguage(question, language, state);
   if (/(shopping|shopping list|shop|grocery|cart|order|checkout|kharidari|kharidna|खरीदारी|कार्ट|ऑर्डर)/i.test(String(question||''))) return { answer: localLangText(lang, 'Shopping Q&A is disabled. Open the Shopping screen to view or manage shopping data.', 'Shopping Q&A hata diya hai. Shopping screen kholkar list ya cart manage karo.', 'Shopping Q&A बंद है। Shopping screen खोलकर list या cart manage करें।'), youtubeQuery: '' };
   const appAnswer = wholeAppAssistantReply(question, state, lang);
   if (appAnswer) return appAnswer;
@@ -1309,6 +1497,8 @@ async function aiReplyGemini(question, state, language = '') {
   const youtubeLang = lang === 'en' ? 'English' : 'Hindi';
   const prompt = `You are FoodWise AI, a helpful general-purpose assistant inside the FoodWise app. You may answer ANY normal user question: general knowledge, study, writing, coding, calculations, explanations, planning, technology, food, recipes, and everyday questions. The app language is ${lang}; answer in ${langLabel} unless the user explicitly requests another language.
 
+Friendly conversation and emotional intelligence: sound like an approachable, thoughtful kitchen companion, not a robotic dashboard. Match the user's tone and language naturally (especially everyday Hindi/Hinglish). If they feel disappointed about spoiled food, waste, or budget, acknowledge that feeling in ONE short, non-judgmental sentence before offering a practical next step. For happy news, celebrate briefly without exaggeration. For straightforward facts, answer directly: no repeated "Absolutely!", unnecessary flattery, therapy language, or boilerplate openers. Use plain short sentences, clear actionable steps, and at most one natural follow-up question if it helps. Avoid excessive emojis, markdown symbols and overly formal words because many replies are read out by voice. Never pretend to have human feelings, personal memories, real-world actions, or knowledge of information not in the app. Safety comes first: spoiled food must not be recommended for eating or feeding to animals.
+
 FoodWise context rule: when the user asks about ANY FoodWise screen or their app data — inventory, consumed/report archive, expiry, notifications, storage, leftovers, nutrition, waste, budget, analytics/impact, household, challenges, daily essentials, meal planning, recipes, or settings — answer from the household data below. For these app-data questions, treat the supplied data as the source of truth. Never pretend an item is in the user's kitchen unless it appears in the provided inventory/leftovers. For food questions, prioritize items closest to expiry.
 
 Recipe rule: if the user asks what to cook, names a dish, asks for a recipe, or asks for a YouTube cooking video, give a useful recipe scaled for household.cookingFor people. Clearly separate ingredients already in inventory from optional/missing ingredients. Give 4-7 short numbered steps and avoid unsafe food-safety claims. ${needsRecipe ? `At the very end add exactly one separate line: YOUTUBE_QUERY: <dish name> recipe ${youtubeLang}. Do not invent a direct video URL.` : 'Do not add a YOUTUBE_QUERY line unless a cooking/recipe/video request is being answered.'}
@@ -1318,7 +1508,7 @@ Household data (use only when relevant): ${JSON.stringify(compact)}
 User: ${safeText(question, 3000)}`;
   const { data } = await geminiGenerateWithFallback('text', {
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.35, maxOutputTokens: 700 }
+    generationConfig: { temperature: 0.55, maxOutputTokens: 780 }
   });
   const raw = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim();
   if (!raw) return aiReply(question, state, lang);
@@ -1452,11 +1642,25 @@ const server = http.createServer(async (req, res) => {
   try {
     if (['TRACE','CONNECT'].includes(String(req.method || '').toUpperCase())) return send(res, 405, { error: 'Method not allowed' }, 'application/json; charset=utf-8', { 'Allow': 'GET, POST, PUT, HEAD' });
     if (!requestOriginAllowed(req)) return send(res, 403, { error: 'Cross-site request blocked' });
+    // Public deploy diagnostic: version and commit only (never expose credentials).
+    if (url.pathname === '/api/version' && req.method === 'GET') {
+      const commit = String(env('RENDER_GIT_COMMIT') || '').replace(/[^a-f0-9]/ig, '').slice(0, 12);
+      return send(res, 200, {
+        app: 'FoodWise Pro',
+        version: APP_VERSION,
+        assets: FRONTEND_VERSION,
+        deployment: commit || 'local',
+        mode: LOCAL_MODE ? 'local' : 'cloud',
+        firebaseConfigured: firebaseConfigured(),
+        aiConfigured: Boolean(GEMINI_API_KEY),
+        imageAiConfigured: cloudflareConfigured()
+      });
+    }
     if (url.pathname === '/api/health') {
       let mongo = LOCAL_MODE ? 'local-json' : 'disconnected';
       if (!LOCAL_MODE) { try { await mongoDb.command({ ping: 1 }); mongo = 'connected'; } catch {} }
       const ok = LOCAL_MODE || mongo === 'connected';
-      return send(res, ok ? 200 : 503, { ok, app: 'FoodWise Pro v32', time: new Date().toISOString() });
+      return send(res, ok ? 200 : 503, { ok, app: `FoodWise Pro v${FRONTEND_VERSION}`, version: APP_VERSION, mode: LOCAL_MODE ? 'local' : 'cloud', mongo, time: new Date().toISOString() });
     }
     if (url.pathname === '/api/config') return send(res, 200, { localMode: LOCAL_MODE, geminiConfigured: Boolean(GEMINI_API_KEY), cloudflareConfigured: cloudflareConfigured(), speechTranscriptionConfigured: Boolean(GEMINI_API_KEY || cloudflareConfigured()), firebaseConfigured: firebaseConfigured(), database: LOCAL_MODE ? 'Local JSON' : 'Cloud database', imageProvider: cloudflareConfigured() ? 'AI images' : 'Local food assets', imageModel: cloudflareConfigured() ? 'Connected' : 'Local', textModel: GEMINI_API_KEY ? 'Connected' : 'FoodWise local AI', apiVersion: 'secured' });
     if (url.pathname.startsWith('/api/images/') && req.method === 'GET') {
@@ -1511,19 +1715,19 @@ const server = http.createServer(async (req, res) => {
         const name = safeText(b.name, 80), email = safeText(b.email, 160).toLowerCase(), password = String(b.password || '');
         const householdName = safeText(b.householdName, 100);
         const members = Math.max(1, Math.min(20, Number(b.members || 1)));
-        if (!name || !email.includes('@') || !strongPassword(password)) return send(res, 400, { error: 'Name, valid email and a 10+ character password containing letters and numbers are required' });
+        if (!name || !email.includes('@') || !acceptablePassword(password)) return send(res, 400, { error: 'Name, valid email and a password of at least 6 characters are required' });
         const rec = writeLocalAuth({ name, email, password });
         const user = localUser(rec);
         const initial = initialStateForUser(user, { name, householdName, members });
         initial.version = 22;
         initial.household.theme = 'dark';
-        await saveUserState(user, initial);
+        await saveUserState(user, initial, { resetChat: true });
         return send(res, 200, { ok: true, user: publicUser(user), localMode: true }, 'application/json; charset=utf-8', { 'Set-Cookie': sessionCookie(LOCAL_SESSION_TOKEN) });
       }
       const name = safeText(b.name, 80), email = safeText(b.email, 160).toLowerCase(), password = String(b.password || '');
       const householdName = safeText(b.householdName, 100);
       const members = Math.max(1, Math.min(20, Number(b.members || 1)));
-      if (!name || !email.includes('@') || !strongPassword(password)) return send(res, 400, { error: 'Name, valid email and a 10+ character password containing letters and numbers are required' });
+      if (!name || !email.includes('@') || !acceptablePassword(password)) return send(res, 400, { error: 'Name, valid email and a password of at least 6 characters are required' });
       let fb;
       try { fb = await firebaseSignUp(email, password); }
       catch (err) { return send(res, err.status || 400, { error: err.message }); }
@@ -1569,7 +1773,7 @@ const server = http.createServer(async (req, res) => {
       const b = await parseBody(req);
       const currentPassword = String(b.currentPassword || '');
       const newPassword = String(b.newPassword || '');
-      if (!currentPassword || !strongPassword(newPassword)) return send(res, 400, { error: 'Current password and a new 10+ character password containing letters and numbers are required' });
+      if (!currentPassword || !acceptablePassword(newPassword)) return send(res, 400, { error: 'Current password and a new password of at least 6 characters are required' });
       if (currentPassword === newPassword) return send(res, 400, { error: 'New password must be different from the current password' });
       if (LOCAL_MODE) {
         const rec = readLocalAuth();
@@ -1594,22 +1798,36 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/push/check' && req.method === 'POST') { const st = await getUserState(user); const sent = await sendDuePushAlertsForUser(String(user._id || user.id), st); return send(res, 200, { ok: true, sent }); }
     if (url.pathname === '/api/state' && req.method === 'GET') return send(res, 200, await getUserState(user));
     if (url.pathname === '/api/state' && req.method === 'PUT') { enforceRateLimit(req, 'state-write', 180, 60*1000, String(user._id || user.id)); const body = await parseBody(req); const saved = await saveUserState(user, body); sendDuePushAlertsForUser(String(user._id || user.id), saved).catch(()=>{}); return send(res, 200, { ok: true }); }
-    if (url.pathname === '/api/reset' && req.method === 'POST') { const fresh = LOCAL_MODE ? migrateState(seed(), localUser()) : initialStateForUser(user, { name: user.name, members: 1, householdName: `${user.name || 'My'}'s Household` }); await saveUserState(user, fresh); return send(res, 200, fresh); }
+    if (url.pathname === '/api/reset' && req.method === 'POST') { const fresh = LOCAL_MODE ? migrateState(seed(), localUser()) : initialStateForUser(user, { name: user.name, members: 1, householdName: `${user.name || 'My'}'s Household` }); await saveUserState(user, fresh, { resetChat: true }); return send(res, 200, fresh); }
     if (url.pathname === '/api/ai' && req.method === 'POST') {
       enforceRateLimit(req, 'ai', 40, 60*1000, String(user._id || user.id));
-      const b = await parseBody(req); const st = await getUserState(user);
-      if (!GEMINI_API_KEY) {
-        const local = aiReply(b.question, st, b.language);
-        return send(res, 200, { answer: local.answer, youtubeSearchUrl: local.youtubeQuery ? youtubeSearchUrl(local.youtubeQuery) : '', youtubeQuery: local.youtubeQuery, provider: 'local', warning: 'GEMINI_API_KEY is not configured' });
+      const b = await parseBody(req);
+      const question = safeText(b.question, 12000).trim();
+      if (!question) return send(res, 400, { error: 'Please enter a chat message' });
+      const st = await getUserState(user);
+      let response;
+      const recycling = spoiledFoodRecyclingReply(question, st, b.language);
+      const friendlyTurn = recycling ? null : friendlyConversationReply(question, st, b.language);
+      if (recycling) {
+        // Always available, without a Gemini warning or an external API call.
+        response = { answer: recycling.answer, youtubeSearchUrl: '', youtubeQuery: '', provider: 'foodwise-recycling', warning: '' };
+      } else if (friendlyTurn) {
+        response = { answer: friendlyTurn.answer, youtubeSearchUrl: '', youtubeQuery: '', provider: 'foodwise-conversation', warning: '' };
+      } else if (!GEMINI_API_KEY) {
+        const local = friendlierLocalReply(question, aiReply(question, st, b.language), st, b.language);
+        response = { answer: local.answer, youtubeSearchUrl: local.youtubeQuery ? youtubeSearchUrl(local.youtubeQuery) : '', youtubeQuery: local.youtubeQuery, provider: 'local', warning: '' };
+      } else {
+        try {
+          const reply = await aiReplyGemini(question, st, b.language);
+          response = { answer: reply.answer, youtubeSearchUrl: reply.youtubeQuery ? youtubeSearchUrl(reply.youtubeQuery) : '', youtubeQuery: reply.youtubeQuery, provider: 'gemini', model: activeTextModel };
+        } catch (err) {
+          console.error('Gemini chat failed:', err.message);
+          const local = friendlierLocalReply(question, aiReply(question, st, b.language), st, b.language);
+          response = { answer: local.answer, youtubeSearchUrl: local.youtubeQuery ? youtubeSearchUrl(local.youtubeQuery) : '', youtubeQuery: local.youtubeQuery, provider: 'local-fallback', warning: err.message, model: activeTextModel };
+        }
       }
-      try {
-        const reply = await aiReplyGemini(b.question, st, b.language);
-        return send(res, 200, { answer: reply.answer, youtubeSearchUrl: reply.youtubeQuery ? youtubeSearchUrl(reply.youtubeQuery) : '', youtubeQuery: reply.youtubeQuery, provider: 'gemini', model: activeTextModel });
-      } catch (err) {
-        console.error('Gemini chat failed:', err.message);
-        const local = aiReply(b.question, st, b.language);
-        return send(res, 200, { answer: local.answer, youtubeSearchUrl: local.youtubeQuery ? youtubeSearchUrl(local.youtubeQuery) : '', youtubeQuery: local.youtubeQuery, provider: 'local-fallback', warning: err.message, model: activeTextModel });
-      }
+      const savedChat = await saveAssistantTurn(user, question, response);
+      return send(res, 200, { ...response, ...savedChat });
     }
     if (url.pathname === '/api/gemini-test' && req.method === 'GET') {
       if (!GEMINI_API_KEY) return send(res, 200, { ok: false, configured: false, message: 'GEMINI_API_KEY is missing in Render/.env' });
@@ -1689,7 +1907,7 @@ async function startServer() {
     const pushTimer=setInterval(()=>runPushNotificationSweep().catch(()=>{}), 5*60*1000);
     pushTimer.unref?.();
     server.listen(PORT, () => {
-      console.log('\n  FoodWise Pro v32 · Security Hardened ✅');
+      console.log('\n  FoodWise Pro v40 · Render Deployment Diagnostics ✅');
       console.log(`  URL:     http://localhost:${PORT}`);
       console.log(`  Health:  http://localhost:${PORT}/api/health`);
       console.log(`  Mode:    ${LOCAL_MODE ? 'LOCAL · JSON storage · login gate enabled' : `CLOUD · MongoDB ${MONGODB_DB_NAME}`}`);
